@@ -1,0 +1,178 @@
+--Create prtnr dim temp table from inital prtnr dim table
+CREATE TABLE adhoc.PRTNR_DIM_TP (
+	PRTNR_DIM_ID bigint, --row_number over(prtnr_id)
+	PRTNR_ID bigint,
+	PRTNR_ORGN_NA varchar(250),
+	USER_TYPE varchar(100),
+	EFFECTIVE_START_DT date,
+	EFFECTIVE_END_DT date
+)
+WITH  
+  (   
+    DISTRIBUTION = HASH (PRTNR_ID),  
+    CLUSTERED COLUMNSTORE INDEX
+  )  
+
+INSERT INTO adhoc.PRTNR_DIM_TP  --row_number over(prtnr_id) for prtnr_dim_id
+select 1, 10, 'Abc', 'Navigator', cast(getdate()-1 as date), NULL
+union all 
+select 2, 11, 'Tree', 'Broker', cast(getdate()-1 as date), NULL
+union all
+select 3, 12, 'House', 'Account Worker', cast(getdate()-1 as date), NULL
+union all
+select 4, 13, 'Xyz', 'Broker', cast(getdate()-1 as date), NULL
+
+
+--Create prtnr dim new table (cdc)
+CREATE TABLE adhoc.PRTNR_DIM_New (
+	PRTNR_DIM_ID bigint, --row_number over(prtnr_id)
+	PRTNR_ID bigint,
+	PRTNR_ORGN_NA varchar(250),
+	USER_TYPE varchar(100)
+)
+WITH  
+  (   
+    DISTRIBUTION = HASH (PRTNR_ID),  
+    CLUSTERED COLUMNSTORE INDEX
+  )  
+
+INSERT INTO adhoc.PRTNR_DIM_New --Run CTAS again next day --row_number over(prtnr_id) for prtnr_dim_id
+select 1, 10, 'Ocean', 'Navigator'
+union all 
+select 2, 11, 'Tree', 'Broker'
+union all
+select 3, 12, 'House', 'Account Worker'
+union all
+select 4, 13, 'Xyz', 'Navigator'
+union all
+select 5, 14, 'River', 'Broker'
+
+
+--Merge new dim table to current dim table
+MERGE adhoc.PRTNR_DIM_TP as TT
+USING (select null as PRTNR_DIM_ID, PRTNR_ID, PRTNR_ORGN_NA, USER_TYPE, cast(getdate() as date) as EFFECTIVE_START_DT, null as EFFECTIVE_END_DT from adhoc.PRTNR_DIM_New
+	UNION ALL
+	select PRTNR_DIM_ID, PRTNR_ID, PRTNR_ORGN_NA, USER_TYPE,  EFFECTIVE_START_DT,  EFFECTIVE_END_DT from adhoc.PRTNR_DIM_TP 
+	where PRTNR_ID in (select PRTNR_ID from adhoc.PRTNR_DIM_New)) as ST
+ON TT.PRTNR_DIM_ID = ST.PRTNR_DIM_ID
+WHEN MATCHED AND TT.EFFECTIVE_END_DT is null THEN
+	UPDATE SET TT.EFFECTIVE_END_DT = cast(getdate() as date)
+WHEN NOT MATCHED THEN
+    INSERT (PRTNR_DIM_ID, PRTNR_ID, PRTNR_ORGN_NA, USER_TYPE, EFFECTIVE_START_DT, EFFECTIVE_END_DT)
+    VALUES (ST.PRTNR_DIM_ID, ST.PRTNR_ID, ST.PRTNR_ORGN_NA, ST.USER_TYPE, ST.EFFECTIVE_START_DT, ST.EFFECTIVE_END_DT);   
+
+
+--Prtnr dim ready for dw with person_dim_id not null
+CREATE TABLE adhoc.PRTNR_DIM 
+ WITH
+    (
+        DISTRIBUTION = REPLICATE,
+		HEAP
+    )
+    AS
+	select DISTINCT 
+		CAST( row_number() over (order by PRTNR_ID) AS bigint) AS PRTNR_DIM_ID,
+		PRTNR_ID, PRTNR_ORGN_NA, USER_TYPE, EFFECTIVE_START_DT, EFFECTIVE_END_DT
+	from adhoc.PRTNR_DIM_TP
+
+select * from adhoc.PRTNR_DIM
+
+--Create replicate source of APPLN table
+CREATE TABLE adhoc.APPLN (
+	APPLN_ID bigint,
+	LOGCL_APPLN_ID bigint,
+	SPCL_USER_ID bigint
+)
+WITH  
+  (   
+    DISTRIBUTION = HASH (APPLN_ID),  
+    CLUSTERED COLUMNSTORE INDEX
+  ) 
+
+INSERT INTO adhoc.APPLN
+select 123, 1000, 10
+union all
+select 345, 2000, 13
+union all 
+select 456, 3000, 12
+
+--Create appln_fact temp table from initial appln_fact table
+CREATE TABLE adhoc.APPLN_FACT_TP (
+	id_key bigint,
+	APPLN_ID bigint,
+	LOGCL_APPLN_ID bigint,
+	PRTNR_DIM_ID bigint, 
+	EFFECTIVE_START_DT date,
+	EFFECTIVE_END_DT date
+)
+WITH  
+  (   
+    DISTRIBUTION = HASH (APPLN_ID),  
+    CLUSTERED COLUMNSTORE INDEX
+  )  
+
+INSERT INTO adhoc.APPLN_FACT_TP  
+select distinct row_number() over(order by LOGCL_APPLN_ID) as id_key,
+	a.APPLN_ID,
+	a.LOGCL_APPLN_ID, 
+	b.PRTNR_DIM_ID,
+	cast(getdate()-1 as date),
+	NULL
+from adhoc.APPLN a 
+left join adhoc.PRTNR_DIM b 
+on a.SPCL_USER_ID = b.PRTNR_ID
+and b.EFFECTIVE_END_DT is not null
+
+--Create new appln table - cdc source
+CREATE TABLE adhoc.APPLN_New (
+	APPLN_ID bigint,
+	LOGCL_APPLN_ID bigint,
+	SPCL_USER_ID bigint
+)
+WITH  
+  (   
+    DISTRIBUTION = HASH (APPLN_ID),  
+    CLUSTERED COLUMNSTORE INDEX
+  ) 
+
+INSERT INTO adhoc.APPLN_New
+select 789, 1000, 10
+union all 
+select 456, 3000, 13
+
+--Create temp fact table for appln source (cdc)
+CREATE TABLE adhoc.APPLN_FACT_New (
+	id_key bigint,
+	APPLN_ID bigint,
+	LOGCL_APPLN_ID bigint,
+	PRTNR_DIM_ID bigint
+)
+WITH  
+  (   
+    DISTRIBUTION = HASH (APPLN_ID),  
+    CLUSTERED COLUMNSTORE INDEX
+  )  
+
+INSERT INTO adhoc.APPLN_FACT_New  
+select distinct row_number() over(order by LOGCL_APPLN_ID) as id_key,
+	a.APPLN_ID,
+	a.LOGCL_APPLN_ID, 
+	b.PRTNR_DIM_ID
+from  adhoc.APPLN_New a 
+left join adhoc.PRTNR_DIM b 
+on a.SPCL_USER_ID = b.PRTNR_ID
+where b.EFFECTIVE_END_DT is not null
+
+--Merge
+MERGE adhoc.APPLN_FACT_TP as TT
+USING (select null as id_key, APPLN_ID, LOGCL_APPLN_ID, PRTNR_DIM_ID, cast(getdate() as date) as EFFECTIVE_START_DT, null as EFFECTIVE_END_DT from adhoc.APPLN_FACT_New
+	UNION ALL
+	select id_key, APPLN_ID, LOGCL_APPLN_ID, PRTNR_DIM_ID,  EFFECTIVE_START_DT,  EFFECTIVE_END_DT from adhoc.APPLN_FACT_TP 
+	where LOGCL_APPLN_ID in (select LOGCL_APPLN_ID from adhoc.APPLN_FACT_New)) as ST
+ON TT.LOGCL_APPLN_ID = ST.LOGCL_APPLN_ID
+WHEN MATCHED AND TT.EFFECTIVE_END_DT is null THEN
+	UPDATE SET TT.EFFECTIVE_END_DT = cast(getdate() as date)
+WHEN NOT MATCHED THEN
+    INSERT (id_key, APPLN_ID, LOGCL_APPLN_ID, PRTNR_DIM_ID,  EFFECTIVE_START_DT,  EFFECTIVE_END_DT)
+    VALUES (st.id_key, ST.APPLN_ID, ST.LOGCL_APPLN_ID, ST.PRTNR_DIM_ID, ST.EFFECTIVE_START_DT, ST.EFFECTIVE_END_DT);  
+
